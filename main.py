@@ -6,6 +6,14 @@ import numpy as np
 import datetime
 import io
 import re
+import json
+from google import genai
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 app = FastAPI()
 
@@ -90,9 +98,8 @@ def format_date_header(val) -> str:
     """Format a date value as a clean short string for display."""
     try:
         ts = pd.Timestamp(val)
-        # Use cross-platform date formatting
         day = ts.day
-        return ts.strftime(f"%b {day}")  # "Sep 16" without zero-padding
+        return ts.strftime(f"%b {day}")
     except Exception:
         return str(val)
 
@@ -146,10 +153,6 @@ def is_total_row(row: pd.Series, primary_col: str) -> bool:
 # ══════════════════════════════════════════════════════
 
 def detect_wide_format(df: pd.DataFrame) -> dict:
-    """
-    Detect if the table uses dates as column headers (wide/pivot format).
-    Works for any domain — payroll, attendance, sales by day, etc.
-    """
     if df.empty or len(df.columns) < 4:
         return {"is_wide": False}
 
@@ -162,13 +165,6 @@ def detect_wide_format(df: pd.DataFrame) -> dict:
     return {"is_wide": False}
 
 def classify_id_columns(df: pd.DataFrame, id_cols: List) -> dict:
-    """
-    Classify non-date columns into:
-    - core: actual identity/dimension columns (name, id, category...)
-    - summary: aggregated/computed columns (totals, averages, capacities)
-    - meta: metadata/links/notes not useful for analysis
-    """
-    # Generic patterns for summary columns
     summary_patterns = re.compile(
         r'\b(total|sum|avg|average|capacity|target|quota|budget|max|min|kpi|rate|ratio|link|url|http|template|note|remark|comment)\b',
         re.IGNORECASE
@@ -180,22 +176,18 @@ def classify_id_columns(df: pd.DataFrame, id_cols: List) -> dict:
     for col in id_cols:
         col_str = str(col).strip()
 
-        # Auto-generated unnamed columns
         if re.match(r'^Column_\d+$', col_str) or col_str.lower() in ("nan", "none", ""):
             meta.append(col)
             continue
 
-        # URL/link content in column name
         if meta_patterns.search(col_str):
             meta.append(col)
             continue
 
-        # Summary keyword in name
         if summary_patterns.search(col_str):
             summary.append(col)
             continue
 
-        # Mostly empty column
         non_null_ratio = df[col].notna().sum() / max(len(df), 1)
         if non_null_ratio < 0.1:
             meta.append(col)
@@ -206,16 +198,10 @@ def classify_id_columns(df: pd.DataFrame, id_cols: List) -> dict:
     return {"core": core, "summary": summary, "meta": meta}
 
 def detect_section_rows(df: pd.DataFrame, core_cols: List) -> Dict[int, str]:
-    """
-    Detect rows that act as group/section headers rather than data rows.
-    These are rows where the primary ID column has a value but all secondary
-    core columns are empty — generic for any wide table structure.
-    """
     if len(core_cols) < 2:
         return {}
 
     primary = core_cols[0]
-    # Use ALL other core cols to confirm emptiness (not just col 1)
     secondary_cols = core_cols[1:]
 
     section_map = {}
@@ -228,7 +214,6 @@ def detect_section_rows(df: pd.DataFrame, core_cols: List) -> Dict[int, str]:
         name = str(pval).strip()
         if skip_keywords.search(name):
             continue
-        # Check if ALL secondary core cols are empty
         all_secondary_empty = all(
             pd.isna(row.get(sc)) or str(row.get(sc, "")).strip() == ""
             for sc in secondary_cols
@@ -239,11 +224,6 @@ def detect_section_rows(df: pd.DataFrame, core_cols: List) -> Dict[int, str]:
     return section_map
 
 def find_value_columns(df: pd.DataFrame, date_cols: List, summary_cols: List) -> List:
-    """
-    Among summary/non-date cols, find which ones look like aggregated values
-    (e.g. Total Production, Total Hours, Amount Due) that are worth keeping in the table.
-    These are numeric columns with decent fill rate.
-    """
     value_keywords = re.compile(
         r'\b(total|sum|amount|production|output|hours|units|qty|quantity|revenue|sales|cost|pay|earned|score)\b',
         re.IGNORECASE
@@ -253,7 +233,6 @@ def find_value_columns(df: pd.DataFrame, date_cols: List, summary_cols: List) ->
         col_str = str(col).strip()
         if not value_keywords.search(col_str):
             continue
-        # Must be mostly numeric
         non_null = df[col].dropna()
         if len(non_null) < 3:
             continue
@@ -263,14 +242,6 @@ def find_value_columns(df: pd.DataFrame, date_cols: List, summary_cols: List) ->
     return result
 
 def build_wide_table(df: pd.DataFrame, wide_info: dict):
-    """
-    Prepare the wide-format table for display:
-    - Format date headers to readable short strings
-    - Add a 'Section' column for group/department rows (if detected)
-    - Remove section header rows and total rows
-    - Keep only core ID cols + key value cols + date cols
-    Returns: (clean_df, renamed_date_cols, core_id_cols, value_col_name)
-    """
     date_cols = wide_info["date_cols"]
     id_cols = wide_info["id_cols"]
 
@@ -278,12 +249,9 @@ def build_wide_table(df: pd.DataFrame, wide_info: dict):
     core_cols = classified["core"]
     summary_cols = classified["summary"]
 
-    # Find any aggregated value columns worth keeping
     value_cols_to_keep = find_value_columns(df, date_cols, summary_cols)
 
-    # Format date column headers
     rename_map = {col: format_date_header(col) for col in date_cols}
-    # Handle duplicate formatted names (e.g. two dates formatting to same string)
     seen = {}
     for orig, formatted in rename_map.items():
         if formatted in seen:
@@ -295,10 +263,8 @@ def build_wide_table(df: pd.DataFrame, wide_info: dict):
     df = df.rename(columns=rename_map)
     renamed_date_cols = [rename_map[c] for c in date_cols]
 
-    # Detect section/group header rows
     section_map = detect_section_rows(df, core_cols)
 
-    # Assign section to each data row
     current_section = None
     section_values = []
     for i, row in df.iterrows():
@@ -313,10 +279,8 @@ def build_wide_table(df: pd.DataFrame, wide_info: dict):
     if has_sections:
         df["Section"] = section_values
 
-    # Remove section header rows
     df = df[~df.index.isin(set(section_map.keys()))]
 
-    # Remove total/summary rows
     if core_cols:
         primary = core_cols[0]
         df = df[df[primary].notna()]
@@ -324,29 +288,19 @@ def build_wide_table(df: pd.DataFrame, wide_info: dict):
             ["total", "grand total", "sub total", "subtotal", "overall", "summary", ""]
         )]
 
-    # Build final column order
     id_part = (["Section"] if has_sections else []) + core_cols
     final_cols = id_part + value_cols_to_keep + renamed_date_cols
     final_cols = [c for c in final_cols if c in df.columns]
     df = df[final_cols].reset_index(drop=True)
 
-    # Determine the best value column name for analytics labels
     value_col_name = value_cols_to_keep[0] if value_cols_to_keep else "Value"
 
     return df, renamed_date_cols, core_cols, value_col_name, has_sections
 
 def build_analytics(df: pd.DataFrame, date_cols: List, core_cols: List, value_col_name: str, has_sections: bool) -> dict:
-    """
-    From the clean wide table, compute analytics tables:
-    - periodTotals: sum per date column (for line chart)
-    - primaryTotals: sum per primary identity (e.g. per person, per product)
-    - sectionTotals: sum per section/group (if sections detected)
-    All computed generically — no domain assumptions.
-    """
     available_date_cols = [c for c in date_cols if c in df.columns]
     primary_col = core_cols[0] if core_cols else None
 
-    # Melt to long format for aggregation
     id_vars = [c for c in (["Section"] if has_sections else []) + core_cols if c in df.columns]
     melted = df[id_vars + available_date_cols].melt(
         id_vars=id_vars,
@@ -358,7 +312,6 @@ def build_analytics(df: pd.DataFrame, date_cols: List, core_cols: List, value_co
     melted[value_col_name] = pd.to_numeric(melted[value_col_name], errors="coerce")
     melted = melted.dropna(subset=[value_col_name])
 
-    # Period totals (preserve original date order)
     period_order = {d: i for i, d in enumerate(available_date_cols)}
     period_totals = (
         melted.groupby("Period")[value_col_name]
@@ -367,7 +320,6 @@ def build_analytics(df: pd.DataFrame, date_cols: List, core_cols: List, value_co
     period_totals["_ord"] = period_totals["Period"].map(period_order)
     period_totals = period_totals.sort_values("_ord").drop("_ord", axis=1)
 
-    # Primary entity totals (per person / product / location etc.)
     primary_totals = None
     if primary_col:
         primary_totals = (
@@ -376,7 +328,6 @@ def build_analytics(df: pd.DataFrame, date_cols: List, core_cols: List, value_co
             .sort_values(value_col_name, ascending=False)
         )
 
-    # Section totals
     section_totals = None
     if has_sections and "Section" in melted.columns:
         section_totals = (
@@ -396,7 +347,7 @@ def build_analytics(df: pd.DataFrame, date_cols: List, core_cols: List, value_co
 
 
 # ══════════════════════════════════════════════════════
-# COLUMN PROFILING
+# COLUMN PROFILING  (kept for fallback + AI context)
 # ══════════════════════════════════════════════════════
 
 def try_parse_date(x) -> bool:
@@ -465,19 +416,36 @@ def detect_column_profile(data: List[Dict], sample_size: int = 100) -> dict:
             "numericRatio": round(num_ratio, 3),
             "dateRatio": round(date_ratio, 3),
         }
+
+        # For numeric columns, add distribution stats to help AI understand the data
         if ctype == "numeric":
-            entry["formatHint"] = detect_format_hint(col, non_null)
+            nums = []
+            for v in non_null:
+                try:
+                    nums.append(float(str(v).replace(",", "")))
+                except Exception:
+                    pass
+            if nums:
+                entry["min"] = round(min(nums), 2)
+                entry["max"] = round(max(nums), 2)
+                entry["mean"] = round(sum(nums) / len(nums), 2)
+                entry["formatHint"] = detect_format_hint(col, non_null)
+                # Detect if this looks like a transaction quantity (mostly 1s)
+                ones_ratio = sum(1 for v in nums if v == 1) / len(nums)
+                if ones_ratio >= 0.7:
+                    entry["grain"] = "transaction_flag"  # each row = 1 item, should SUM across rows
+                elif ones_ratio <= 0.1 and entry["max"] > entry["mean"] * 5:
+                    entry["grain"] = "quantity"  # variable quantities per row
+
         profile[col] = entry
     return profile
 
-# Columns that are almost certainly row indices, not real measures
 INDEX_COL_NAMES = {"no", "no.", "num", "#", "sr", "sr.", "s/n", "seq", "sequence", "index", "row", "row no", "row no.", "sl", "sl."}
 
 def is_index_column(col: str, profile: dict) -> bool:
     if col.strip().lower() in INDEX_COL_NAMES:
         return True
     p = profile.get(col, {})
-    # High uniqueness + fully numeric + small values = likely sequential index
     if p.get("uniqueRatio", 0) >= 0.95 and p.get("numericRatio", 0) >= 0.95:
         return True
     return False
@@ -488,7 +456,6 @@ def score_measure(col: str, profile: dict) -> float:
     p = profile[col]
     name = col.lower()
     score = p.get("nonNull", 0) / 10
-    # Generic high-value measure keywords (no domain-specific terms)
     high_value = ["total", "amount", "value", "revenue", "sales", "cost", "count",
                   "hours", "units", "qty", "quantity", "budget", "output", "score", "sum"]
     for k in high_value:
@@ -503,14 +470,12 @@ def score_dimension(col: str, profile: dict) -> float:
         return -1
     score = 0
     name = col.lower()
-    # Generic dimension keywords
     dim_keywords = ["name", "category", "type", "region", "site", "location", "team",
                     "department", "status", "group", "class", "division", "branch",
                     "product", "project", "client", "customer", "country", "city"]
     for k in dim_keywords:
         if k in name:
             score += 4
-    # Sweet spot: enough variety to be interesting, not too many to be an identifier
     if 2 <= uniq <= 30:
         score += 5
     elif 31 <= uniq <= 100:
@@ -539,6 +504,301 @@ def pick_date_col(profile: dict) -> Optional[str]:
 
 
 # ══════════════════════════════════════════════════════
+# AI AGENT: BLUEPRINT GENERATION
+# ══════════════════════════════════════════════════════
+
+def build_ai_prompt(headers: List[str], sample_rows: List[Dict], profile: dict, table_format: str) -> str:
+    """
+    Build a flexible prompt for Gemini to analyze any dataset and return
+    a rich dashboard blueprint.
+    """
+    # Format sample rows as a readable mini-table
+    sample_str = ""
+    for i, row in enumerate(sample_rows[:15]):
+        row_parts = [f"{k}: {repr(v)}" for k, v in row.items()]
+        sample_str += f"  Row {i+1}: {{ {', '.join(row_parts)} }}\n"
+
+    # Rich profile summary with stats and sample values
+    profile_summary = []
+    for col, p in profile.items():
+        sample_vals = list({str(r.get(col)) for r in sample_rows[:30] if r.get(col) is not None})[:5]
+        desc = (
+            f"  - {col!r}: type={p['type']}, unique={p.get('unique', '?')}, "
+            f"fill={p.get('nonNull', '?')} rows"
+        )
+        if p.get("formatHint"):
+            desc += f", format={p['formatHint']}"
+        if p.get("min") is not None:
+            desc += f", min={p['min']}, max={p['max']}, mean={p['mean']}"
+        if p.get("grain"):
+            desc += f", grain={p['grain']}"
+            if p["grain"] == "transaction_flag":
+                desc += " ⚠️ mostly-1s column: SUM across rows to get meaningful totals"
+        if sample_vals:
+            desc += f", samples={sample_vals}"
+        profile_summary.append(desc)
+
+    # Separate columns by detected type for easier AI reasoning
+    numeric_cols = [c for c, p in profile.items() if p["type"] == "numeric"]
+    date_cols = [c for c, p in profile.items() if p["type"] == "date"]
+    category_cols = [c for c, p in profile.items() if p["type"] == "category"]
+    identifier_cols = [c for c, p in profile.items() if p["type"] == "identifier"]
+
+    return f"""You are an expert data analyst. Your job is to analyze a dataset and produce a dashboard blueprint.
+
+════════════════════════════════════════
+DATASET OVERVIEW
+════════════════════════════════════════
+- Table format: {table_format}
+- Total columns: {len(headers)}
+- All column names: {headers}
+
+PRE-CLASSIFIED COLUMNS (based on data profiling):
+  Numeric columns  : {numeric_cols}
+  Date columns     : {date_cols}
+  Category columns : {category_cols}
+  Identifier cols  : {identifier_cols}
+
+DETAILED COLUMN PROFILES:
+{chr(10).join(profile_summary)}
+
+SAMPLE DATA (up to 15 rows):
+{sample_str}
+
+════════════════════════════════════════
+YOUR ANALYSIS TASK
+════════════════════════════════════════
+Step 1 — Understand the dataset:
+  - What domain is this? (HR, sales, production, finance, logistics, etc.)
+  - What is the grain of each row? (one transaction? one employee? one day?)
+  - What is the user most likely trying to track or measure?
+
+Step 2 — Decide on KPI cards (3–5 cards):
+  - Pick the most important numeric columns to SUM (totals, quantities, amounts)
+  - Pick key category columns to COUNT DISTINCT (how many sites, people, products, etc.)
+  - Pick averages only when a rate/score makes sense
+  - NEVER use row number / serial / index columns
+
+Step 3 — Decide on charts (1–3 charts):
+  - If a DATE column exists → always include a LINE chart showing a numeric measure over time
+  - If a good CATEGORY column exists (2–20 unique values) → include a BAR chart of top values
+  - If share/composition matters → include a DONUT chart
+  - Chart types available: "line", "bar", "donut"
+  - For line charts: x must be a DATE column, y must be a NUMERIC column
+  - For bar/donut charts: x is a CATEGORY column, y is a NUMERIC column
+
+Step 4 — Decide on pivot tables (1–3 pivots):
+  - Pick the most insightful dimension × measure combinations
+  - If two good category columns exist, use colDim for a cross-tab (e.g. Site × Language)
+  - Use aggregation="count" when the measure column is categorical or when counting rows makes sense
+  - Use aggregation="sum" for numeric totals
+  - Use aggregation="avg" for rates and scores
+
+════════════════════════════════════════
+OUTPUT FORMAT
+════════════════════════════════════════
+Return ONLY a valid JSON object. No markdown, no explanation, no code fences.
+
+{{
+  "datasetSummary": "One clear sentence describing what this dataset tracks",
+  "cards": [
+    {{
+      "id": "card_1",
+      "label": "Friendly KPI label shown to user",
+      "column": "EXACT column name from headers",
+      "aggregation": "sum",
+      "formatHint": "number"
+    }}
+  ],
+  "charts": [
+    {{
+      "id": "chart_1",
+      "type": "line",
+      "title": "Descriptive chart title",
+      "x": "EXACT column name (date for line, category for bar/donut)",
+      "y": "EXACT numeric column name"
+    }}
+  ],
+  "pivots": [
+    {{
+      "id": "pivot_1",
+      "title": "Descriptive pivot title",
+      "rowDim": "EXACT dimension column name",
+      "colDim": "EXACT second dimension or null",
+      "measure": "EXACT column name to aggregate",
+      "aggregation": "sum"
+    }}
+  ]
+}}
+
+STRICT RULES:
+1. Every column name must be an EXACT match from: {headers}
+2. Never use index/serial/row-number columns (like 'No', '#', 'Sr')
+3. cards.aggregation must be one of: "sum", "avg", "count"
+4. charts.type must be one of: "line", "bar", "donut"
+5. Line chart x MUST be a date column, bar/donut x MUST be a category column
+6. pivots.aggregation must be one of: "sum", "avg", "count"
+7. If no date column exists, do not generate a line chart
+8. Aim for variety — don't repeat the same column across all charts/pivots
+9. colDim in pivots should be null if no good second dimension exists
+10. TRANSACTION LOG PATTERN: If rows are individual transactions (each row = 1 event/item),
+    always SUM the quantity column grouped by date/category — never show raw per-row values.
+    A column with grain=transaction_flag means it's mostly 1s and must be SUMmed to be useful.
+11. For line charts on transaction data, the y-axis should show TOTAL count per day/period, not individual row values."""
+
+
+def build_ai_blueprint_wide(analytics: dict, primary_col: str, value_col: str, headers: List[str]) -> dict:
+    """
+    For wide-format tables, AI still adds value by improving KPI card labels
+    and understanding the domain — but analytics are pre-computed.
+    """
+    prompt = f"""You are a data analyst AI. This is a WIDE FORMAT spreadsheet (dates as columns).
+The backend has already computed analytics. Your job is to generate smart KPI card definitions.
+
+Columns in the final table: {headers}
+Primary entity column: {primary_col!r}
+Value column: {value_col!r}
+
+Return ONLY valid JSON (no markdown):
+{{
+  "datasetSummary": "One sentence about what this dataset tracks",
+  "cards": [
+    {{
+      "id": "card_1",
+      "label": "KPI label",
+      "value": 0,
+      "formatHint": "currency" | "percent" | "number"
+    }}
+  ]
+}}
+
+For wide format, cards have pre-computed values so set value to 0 — the backend will fill them in.
+Generate 3 meaningful KPI cards based on the column names and domain context."""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        raw = response.text.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[AI Agent Wide] Error: {e}")
+        return None
+
+
+def generate_blueprint_with_ai(
+    headers: List[str],
+    data: List[Dict],
+    profile: dict,
+    table_format: str,
+    analytics: Optional[dict] = None,
+) -> dict:
+    """
+    Call Gemini to generate a dashboard blueprint, with fallback to
+    rule-based logic if the AI call fails.
+    """
+    prompt = build_ai_prompt(headers, data, profile, table_format)
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        raw = response.text.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        ai_blueprint = json.loads(raw)
+
+        # Validate all column references exist
+        valid_headers = set(headers)
+        def validate_col(col):
+            return col if col in valid_headers else None
+
+        # Clean up cards
+        cards = []
+        for card in ai_blueprint.get("cards", []):
+            col = validate_col(card.get("column", ""))
+            if col:
+                cards.append({**card, "column": col})
+
+        # Clean up charts — validate both x and y columns exist
+        charts = []
+        for chart in ai_blueprint.get("charts", []):
+            x = validate_col(chart.get("x", ""))
+            y = validate_col(chart.get("y", ""))
+            if x and y:
+                charts.append({**chart, "x": x, "y": y})
+            else:
+                print(f"[AI Agent] Dropping chart '{chart.get('id')}' — invalid columns x={chart.get('x')!r} y={chart.get('y')!r}")
+
+        # Clean up pivots
+        pivots = []
+        for pivot in ai_blueprint.get("pivots", []):
+            row_dim = validate_col(pivot.get("rowDim", ""))
+            col_dim = validate_col(pivot.get("colDim")) if pivot.get("colDim") else None
+            measure = validate_col(pivot.get("measure", ""))
+            if row_dim and measure:
+                pivots.append({**pivot, "rowDim": row_dim, "colDim": col_dim, "measure": measure})
+
+        return {
+            "datasetSummary": ai_blueprint.get("datasetSummary", ""),
+            "cards": cards,
+            "charts": charts,
+            "pivots": pivots,
+            "aiGenerated": True,
+        }
+
+    except Exception as e:
+        print(f"[AI Agent] Error: {e}. Falling back to rule-based blueprint.")
+        return None  # Signal to use fallback
+
+
+def generate_blueprint_fallback(profile: dict, analytics: Optional[dict], table_format: str) -> dict:
+    """
+    Original rule-based blueprint generation — used as fallback if AI fails.
+    """
+    cards, charts, pivots = [], [], []
+
+    measures = pick_measures(profile)
+    dimensions = pick_dimensions(profile)
+    date_col = pick_date_col(profile)
+
+    primary_measure = measures[0] if measures else None
+    primary_dim = dimensions[0] if dimensions else None
+
+    for i, m in enumerate(measures):
+        hint = profile[m].get("formatHint", "number")
+        cards.append({"id": f"card_sum_{i}", "label": f"Total {m}", "column": m, "aggregation": "sum", "formatHint": hint})
+    if primary_dim:
+        cards.append({"id": "card_unique", "label": f"Unique {primary_dim}s", "column": primary_dim, "aggregation": "count", "formatHint": "number"})
+
+    if date_col and primary_measure:
+        charts.append({
+            "id": "chart_line_0",
+            "type": "line",
+            "title": f"{primary_measure} over time",
+            "x": date_col,
+            "y": primary_measure,
+        })
+
+    for i, dim in enumerate(dimensions[:2]):
+        if primary_measure:
+            pivots.append({
+                "id": f"pivot_{i}",
+                "title": f"{primary_measure} by {dim}",
+                "rowDim": dim,
+                "colDim": None,
+                "measure": primary_measure,
+                "aggregation": "sum",
+            })
+
+    return {"cards": cards, "charts": charts, "pivots": pivots, "aiGenerated": False}
+
+
+# ══════════════════════════════════════════════════════
 # ENDPOINTS
 # ══════════════════════════════════════════════════════
 
@@ -559,7 +819,6 @@ async def extract_raw_table(file: UploadFile = File(...), sheet_name: str = None
     df = pd.read_excel(excel, sheet_name=sheet_name, header=None)
     df = df.dropna(how="all")
 
-    # Skip single-cell title rows at the top
     first_row = df.iloc[0]
     non_empty = first_row.notna().sum()
     unique_ratio = first_row.nunique() / non_empty if non_empty > 0 else 0
@@ -622,9 +881,7 @@ async def generate_dashboard_blueprint(payload: Dict[str, Any] = Body(...)):
     data = rows_to_objects(headers, rows)
     profile = detect_column_profile(data)
 
-    cards, charts, pivots = [], [], []
-
-    # ── WIDE FORMAT: analytics already computed by backend ────────────
+    # ── WIDE FORMAT: analytics already computed, AI enhances card labels ──
     if table_format == "wide" and analytics:
         primary_col = analytics.get("primaryCol")
         value_col = analytics.get("valueCol", "Value")
@@ -633,18 +890,20 @@ async def generate_dashboard_blueprint(payload: Dict[str, Any] = Body(...)):
         primary_data = analytics.get("primaryTotals")
         section_data = analytics.get("sectionTotals")
 
-        # KPI cards — derived generically from primary totals
+        # Compute KPI values
+        cards = []
         if primary_data:
             objs = rows_to_objects(primary_data["headers"], primary_data["rows"])
             values = [float(r[value_col]) for r in objs if is_number(r.get(value_col))]
             if values:
+                hint = detect_format_hint(value_col, values)
                 cards = [
-                    {"id": "card_total", "label": f"Total {value_col}", "value": sum(values), "formatHint": detect_format_hint(value_col, values)},
-                    {"id": "card_avg", "label": f"Avg {value_col} per {primary_col or 'Entity'}", "value": sum(values) / len(values), "formatHint": detect_format_hint(value_col, values)},
+                    {"id": "card_total", "label": f"Total {value_col}", "value": sum(values), "formatHint": hint},
+                    {"id": "card_avg", "label": f"Avg {value_col} per {primary_col or 'Entity'}", "value": sum(values) / len(values), "formatHint": hint},
                     {"id": "card_count", "label": f"Total {primary_col or 'Entities'}", "value": len(values), "formatHint": "number"},
                 ]
 
-        # Line chart over periods
+        charts = []
         if period_data and len(period_data["rows"]) > 1:
             charts.append({
                 "id": "chart_line_period",
@@ -655,21 +914,11 @@ async def generate_dashboard_blueprint(payload: Dict[str, Any] = Body(...)):
                 "y": value_col,
             })
 
-        # Pivot: by primary entity
+        pivots = []
         if primary_data:
-            pivots.append({
-                "id": "pivot_primary",
-                "title": f"{value_col} by {primary_col or 'Entity'}",
-                "dataSource": "primaryTotals",
-            })
-
-        # Pivot: by section (only if multiple sections exist)
+            pivots.append({"id": "pivot_primary", "title": f"{value_col} by {primary_col or 'Entity'}", "dataSource": "primaryTotals"})
         if section_data and len(section_data["rows"]) > 1:
-            pivots.append({
-                "id": "pivot_section",
-                "title": f"{value_col} by Section",
-                "dataSource": "sectionTotals",
-            })
+            pivots.append({"id": "pivot_section", "title": f"{value_col} by Section", "dataSource": "sectionTotals"})
 
         return {
             "profile": profile,
@@ -678,50 +927,32 @@ async def generate_dashboard_blueprint(payload: Dict[str, Any] = Body(...)):
             "pivots": pivots,
             "tableFormat": "wide",
             "analytics": analytics,
+            "aiGenerated": False,
         }
 
-    # ── LONG FORMAT ───────────────────────────────────────────────────
-    measures = pick_measures(profile)
-    dimensions = pick_dimensions(profile)
-    date_col = pick_date_col(profile)
+    # ── LONG FORMAT: AI agent generates blueprint ─────────────────────
+    ai_result = generate_blueprint_with_ai(headers, data, profile, table_format, analytics)
 
-    primary_measure = measures[0] if measures else None
-    primary_dim = dimensions[0] if dimensions else None
+    if ai_result:
+        return {
+            "profile": profile,
+            "cards": ai_result["cards"],
+            "charts": ai_result["charts"],
+            "pivots": ai_result["pivots"],
+            "tableFormat": "long",
+            "analytics": None,
+            "aiGenerated": True,
+            "datasetSummary": ai_result.get("datasetSummary", ""),
+        }
 
-    # KPI cards
-    for i, m in enumerate(measures):
-        hint = profile[m].get("formatHint", "number")
-        cards.append({"id": f"card_sum_{i}", "label": f"Total {m}", "column": m, "aggregation": "sum", "formatHint": hint})
-    if primary_dim:
-        cards.append({"id": "card_unique", "label": f"Unique {primary_dim}s", "column": primary_dim, "aggregation": "count", "formatHint": "number"})
-
-    # Line chart if date + measure exist
-    if date_col and primary_measure:
-        charts.append({
-            "id": "chart_line_0",
-            "type": "line",
-            "title": f"{primary_measure} over time",
-            "x": date_col,
-            "y": primary_measure,
-        })
-
-    # Up to 2 pivots
-    for i, dim in enumerate(dimensions[:2]):
-        if primary_measure:
-            pivots.append({
-                "id": f"pivot_{i}",
-                "title": f"{primary_measure} by {dim}",
-                "rowDim": dim,
-                "colDim": None,
-                "measure": primary_measure,
-                "aggregation": "sum",
-            })
-
+    # ── FALLBACK: rule-based ──────────────────────────────────────────
+    fallback = generate_blueprint_fallback(profile, analytics, table_format)
     return {
         "profile": profile,
-        "cards": cards,
-        "charts": charts,
-        "pivots": pivots,
+        "cards": fallback["cards"],
+        "charts": fallback["charts"],
+        "pivots": fallback["pivots"],
         "tableFormat": "long",
         "analytics": None,
+        "aiGenerated": False,
     }
