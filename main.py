@@ -956,3 +956,109 @@ async def generate_dashboard_blueprint(payload: Dict[str, Any] = Body(...)):
         "analytics": None,
         "aiGenerated": False,
     }
+
+# ══════════════════════════════════════════════════════
+# CHAT ENDPOINT
+# ══════════════════════════════════════════════════════
+
+from pydantic import BaseModel
+
+class ChatMessage(BaseModel):
+    role: str        # "user" or "assistant"
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    headers: List[str]
+    rows: List[List]
+    datasetSummary: Optional[str] = None
+
+@app.post("/chat")
+async def chat(payload: ChatRequest):
+    headers = payload.headers
+    rows = payload.rows
+    messages = payload.messages
+
+    if not messages or not headers:
+        return {"reply": "No data or messages provided."}
+
+    # Build compact column profiles from the full dataset server-side
+    col_profiles = []
+    for col_idx, col in enumerate(headers):
+        vals = [
+            row[col_idx] for row in rows
+            if col_idx < len(row)
+            and row[col_idx] is not None
+            and str(row[col_idx]).strip() != ""
+        ]
+        if not vals:
+            col_profiles.append(f"  • {col}: empty")
+            continue
+
+        num_vals = []
+        for v in vals:
+            try:
+                num_vals.append(float(str(v).replace(",", "")))
+            except Exception:
+                pass
+
+        if len(num_vals) / len(vals) >= 0.7 and num_vals:
+            total = sum(num_vals)
+            avg = total / len(num_vals)
+            col_profiles.append(
+                f"  • {col}: numeric | sum={total:,.2f}, avg={avg:,.2f}, "
+                f"min={min(num_vals):,.2f}, max={max(num_vals):,.2f}, count={len(num_vals)}"
+            )
+        else:
+            unique = list({str(v).strip() for v in vals})
+            samples = ", ".join(unique[:8])
+            col_profiles.append(
+                f"  • {col}: category | {len(unique)} unique values: "
+                f"[{samples}{'...' if len(unique) > 8 else ''}]"
+            )
+
+    # Sample rows as readable text
+    sample_lines = []
+    for i, row in enumerate(rows[:15]):
+        parts = [f"{headers[j]}: {row[j]}" for j in range(min(len(headers), len(row)))]
+        sample_lines.append(f"  Row {i+1}: {' | '.join(parts)}")
+
+    # Build full prompt with context + conversation history
+    system_context = f"""You are a data analyst assistant. The user has uploaded a spreadsheet and wants to ask questions about it.
+
+DATASET OVERVIEW:
+- Total rows: {len(rows):,}
+- Columns ({len(headers)}): {headers}
+- AI Summary: {payload.datasetSummary or "N/A"}
+
+COLUMN PROFILES (computed from full dataset):
+{chr(10).join(col_profiles)}
+
+SAMPLE DATA (first 15 rows):
+{chr(10).join(sample_lines)}
+
+INSTRUCTIONS:
+- Answer questions about this dataset concisely and accurately
+- Use column profiles for aggregate stats (sums, averages, counts, unique values)
+- Format numbers with commas for readability
+- Keep answers brief unless the user asks for detail
+- If a question requires data beyond what is profiled, acknowledge the limitation"""
+
+    # Format conversation history
+    history = "\n\n".join(
+        f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}"
+        for m in messages
+    )
+
+    full_prompt = f"{system_context}\n\n--- CONVERSATION ---\n{history}\n\nAssistant:"
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=full_prompt,
+        )
+        reply = response.text.strip().removeprefix("Assistant:").strip()
+        return {"reply": reply}
+    except Exception as e:
+        print(f"[Chat] Error: {e}")
+        return {"reply": "Sorry, I couldn't process that right now. Please try again."}
