@@ -980,9 +980,23 @@ async def chat(payload: ChatRequest):
     messages = payload.messages
 
     if not messages or not headers:
-        return {"reply": "No data or messages provided."}
+        return {"reply": "No data or messages provided.", "chartSpec": None}
 
-    # Build compact column profiles from the full dataset server-side
+    # ── Full dataset as CSV string ──────────────────────────────────
+    # Send every row so AI can do exact lookups, groupings, counts
+    csv_header = ",".join(f'"{h}"' for h in headers)
+    csv_rows = []
+    for row in rows:
+        cells = []
+        for cell in row:
+            if cell is None:
+                cells.append("")
+            else:
+                cells.append(f'"{str(cell)}"')
+        csv_rows.append(",".join(cells))
+    full_csv = csv_header + "\n" + "\n".join(csv_rows)
+
+    # ── Column profiles for quick context ──────────────────────────
     col_profiles = []
     for col_idx, col in enumerate(headers):
         vals = [
@@ -1017,34 +1031,37 @@ async def chat(payload: ChatRequest):
                 f"[{samples}{'...' if len(unique) > 8 else ''}]"
             )
 
-    # Sample rows as readable text
-    sample_lines = []
-    for i, row in enumerate(rows[:15]):
-        parts = [f"{headers[j]}: {row[j]}" for j in range(min(len(headers), len(row)))]
-        sample_lines.append(f"  Row {i+1}: {' | '.join(parts)}")
-
-    # Build full prompt with context + conversation history
-    system_context = f"""You are a data analyst assistant. The user has uploaded a spreadsheet and wants to ask questions about it.
+    system_context = f"""You are a data analyst assistant. The user has uploaded a spreadsheet.
+You have access to the FULL dataset below — use it to answer questions precisely.
 
 DATASET OVERVIEW:
 - Total rows: {len(rows):,}
 - Columns ({len(headers)}): {headers}
 - AI Summary: {payload.datasetSummary or "N/A"}
 
-COLUMN PROFILES (computed from full dataset):
+COLUMN PROFILES (pre-computed aggregates):
 {chr(10).join(col_profiles)}
 
-SAMPLE DATA (first 15 rows):
-{chr(10).join(sample_lines)}
+FULL DATASET (CSV):
+{full_csv}
 
 INSTRUCTIONS:
-- Answer questions about this dataset concisely and accurately
-- Use column profiles for aggregate stats (sums, averages, counts, unique values)
+- Use the full CSV data to answer questions exactly — count rows, group by columns, sum values, find top N, etc.
 - Format numbers with commas for readability
-- Keep answers brief unless the user asks for detail
-- If a question requires data beyond what is profiled, acknowledge the limitation"""
+- Keep answers concise unless the user asks for detail
+- After answering, if the question implies a useful chart or pivot table could visualize the answer,
+  append a JSON spec on a NEW LINE starting with exactly "CHART_SPEC:" followed by valid JSON.
+  Only suggest a spec when it adds genuine value (rankings, trends, breakdowns).
 
-    # Format conversation history
+CHART_SPEC format (pick the most appropriate type):
+CHART_SPEC: {{"type": "bar", "title": "...", "x": "EXACT column name", "y": "EXACT column name"}}
+CHART_SPEC: {{"type": "donut", "title": "...", "x": "EXACT column name", "y": "EXACT column name"}}
+CHART_SPEC: {{"type": "line", "title": "...", "x": "EXACT date column", "y": "EXACT numeric column"}}
+CHART_SPEC: {{"type": "pivot", "title": "...", "rowDim": "EXACT column", "colDim": "EXACT column or null", "measure": "EXACT column", "aggregation": "sum"}}
+
+Column names in spec MUST exactly match one of: {headers}
+Only output CHART_SPEC if confident it adds value. Never output it for simple factual questions."""
+
     history = "\n\n".join(
         f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}"
         for m in messages
@@ -1057,8 +1074,34 @@ INSTRUCTIONS:
             model="gemini-2.5-flash",
             contents=full_prompt,
         )
-        reply = response.text.strip().removeprefix("Assistant:").strip()
-        return {"reply": reply}
+        raw = response.text.strip().removeprefix("Assistant:").strip()
+
+        # Parse out optional CHART_SPEC
+        chart_spec = None
+        reply_text = raw
+        if "CHART_SPEC:" in raw:
+            parts = raw.split("CHART_SPEC:", 1)
+            reply_text = parts[0].strip()
+            try:
+                spec_raw = parts[1].strip()
+                # Extract just the JSON object
+                spec_raw = re.sub(r'^```(?:json)?\s*', '', spec_raw)
+                spec_raw = re.sub(r'\s*```$', '', spec_raw)
+                chart_spec = json.loads(spec_raw)
+                # Validate columns exist
+                valid = set(headers)
+                if chart_spec.get("x") and chart_spec["x"] not in valid:
+                    chart_spec = None
+                if chart_spec and chart_spec.get("y") and chart_spec["y"] not in valid:
+                    chart_spec = None
+                if chart_spec and chart_spec.get("rowDim") and chart_spec["rowDim"] not in valid:
+                    chart_spec = None
+            except Exception as parse_err:
+                print(f"[Chat] Chart spec parse error: {parse_err}")
+                chart_spec = None
+
+        return {"reply": reply_text, "chartSpec": chart_spec}
+
     except Exception as e:
         print(f"[Chat] Error: {e}")
-        return {"reply": "Sorry, I couldn't process that right now. Please try again."}
+        return {"reply": "Sorry, I couldn't process that right now. Please try again.", "chartSpec": None}
