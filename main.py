@@ -9,6 +9,7 @@ import re
 import json
 from google import genai
 import os
+import pathlib
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,7 +20,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "https://headcount-ai.netlify.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1105,3 +1106,184 @@ Only output CHART_SPEC if confident it adds value. Never output it for simple fa
     except Exception as e:
         print(f"[Chat] Error: {e}")
         return {"reply": "Sorry, I couldn't process that right now. Please try again.", "chartSpec": None}
+
+
+# ══════════════════════════════════════════════════════
+# FILE BROWSER ENDPOINTS
+# ══════════════════════════════════════════════════════
+
+WATCHED_FOLDER: pathlib.Path = None  # Set via /set-folder
+
+
+@app.post("/set-folder")
+async def set_folder(body: dict = Body(...)):
+    """Set the folder path to watch for Excel files."""
+    global WATCHED_FOLDER
+    path = body.get("path", "").strip()
+    if not path:
+        return {"error": "No path provided"}
+    p = pathlib.Path(path).expanduser().resolve()
+    if not p.exists():
+        return {"error": f"Folder does not exist: {p}"}
+    if not p.is_dir():
+        return {"error": f"Not a folder: {p}"}
+    WATCHED_FOLDER = p
+    return {"path": str(p), "ok": True}
+
+
+@app.get("/list-files")
+async def list_files():
+    """List all Excel files in the watched folder."""
+    if WATCHED_FOLDER is None:
+        return {"folder": None, "files": []}
+
+    files = []
+    try:
+        for entry in sorted(WATCHED_FOLDER.iterdir()):
+            if entry.is_file() and entry.suffix.lower() in (".xlsx", ".xls"):
+                stat = entry.stat()
+                files.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "size": stat.st_size,
+                    "modified": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                })
+    except PermissionError:
+        return {"error": "Permission denied reading folder", "files": []}
+
+    return {"folder": str(WATCHED_FOLDER), "files": files}
+
+
+@app.post("/analyze-file")
+async def analyze_file(body: dict = Body(...)):
+    """
+    Read an Excel file by local path, run full extraction + AI blueprint.
+    Returns tableData + blueprint in one shot.
+    """
+    file_path = body.get("path", "").strip()
+    sheet_name = body.get("sheet_name", None)
+
+    if not file_path:
+        return {"error": "No path provided"}
+
+    p = pathlib.Path(file_path).expanduser().resolve()
+    if not p.exists() or not p.is_file():
+        return {"error": f"File not found: {file_path}"}
+    if p.suffix.lower() not in (".xlsx", ".xls"):
+        return {"error": "Not an Excel file"}
+
+    try:
+        contents = p.read_bytes()
+    except PermissionError:
+        return {"error": "Permission denied"}
+
+    excel = pd.ExcelFile(io.BytesIO(contents))
+    all_sheets = excel.sheet_names
+
+    if not sheet_name or sheet_name not in all_sheets:
+        sheet_name = all_sheets[0]
+
+    # ── Extract table (same logic as /extract-raw-table) ──
+    df = pd.read_excel(excel, sheet_name=sheet_name, header=None)
+    df = df.dropna(how="all")
+
+    first_row = df.iloc[0]
+    non_empty = first_row.notna().sum()
+    unique_ratio = first_row.nunique() / non_empty if non_empty > 0 else 0
+    if non_empty <= 2 or unique_ratio < 0.5:
+        df = df.iloc[1:].reset_index(drop=True)
+
+    header_row_index = find_header_row(df)
+    df = cut_by_header_gap(df, header_row_index)
+    df.columns = df.iloc[header_row_index]
+    df = df.iloc[header_row_index + 1:].reset_index(drop=True)
+    df.columns = [
+        str(col).strip() if pd.notna(col) else f"Column_{i}"
+        for i, col in enumerate(df.columns)
+    ]
+    df = df.dropna(axis=1, how="all")
+    df = df[~df.astype(str).apply(
+        lambda row: row.str.contains(r"Grand Total|Sum of", case=False, regex=True).any(), axis=1
+    )]
+    df = cut_after_empty_column(df)
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    wide_info = detect_wide_format(df)
+
+    if wide_info["is_wide"]:
+        df_wide, renamed_date_cols, core_cols, value_col_name, has_sections = build_wide_table(df, wide_info)
+        analytics = build_analytics(df_wide, renamed_date_cols, core_cols, value_col_name, has_sections)
+        table_data = {
+            **df_to_payload(df_wide),
+            "tableFormat": "wide",
+            "wasTransformed": True,
+            "transformNote": f"Wide format: {len(renamed_date_cols)} date columns across {len(df_wide)} rows.",
+            "analytics": analytics,
+        }
+    else:
+        records = df.to_dict(orient="records")
+        rows_out = [[clean_value(row.get(col)) for col in df.columns] for row in records]
+        table_data = {
+            "headers": list(df.columns),
+            "rows": rows_out,
+            "rowCount": len(rows_out),
+            "columnCount": len(df.columns),
+            "tableFormat": "long",
+            "wasTransformed": False,
+            "transformNote": None,
+            "analytics": None,
+        }
+
+    # ── Generate blueprint (same logic as /generate-dashboard-blueprint) ──
+    headers = table_data["headers"]
+    rows_data = table_data["rows"]
+    analytics = table_data.get("analytics")
+    table_format = table_data.get("tableFormat", "long")
+    data_objects = rows_to_objects(headers, rows_data)
+    profile = detect_column_profile(data_objects)
+
+    if table_format == "wide" and analytics:
+        primary_col = analytics.get("primaryCol")
+        value_col  = analytics.get("valueCol", "Value")
+        period_col = analytics.get("periodCol", "Period")
+        period_data  = analytics.get("periodTotals")
+        primary_data = analytics.get("primaryTotals")
+        section_data = analytics.get("sectionTotals")
+        cards = []
+        if primary_data:
+            objs = rows_to_objects(primary_data["headers"], primary_data["rows"])
+            values = [float(r[value_col]) for r in objs if is_number(r.get(value_col))]
+            if values:
+                hint = detect_format_hint(value_col, values)
+                cards = [
+                    {"id": "card_total",  "label": f"Total {value_col}", "value": sum(values), "formatHint": hint},
+                    {"id": "card_avg",    "label": f"Avg {value_col} per {primary_col or 'Entity'}", "value": sum(values)/len(values), "formatHint": hint},
+                    {"id": "card_count",  "label": f"Total {primary_col or 'Entities'}", "value": len(values), "formatHint": "number"},
+                ]
+        charts, pivots = [], []
+        if period_data and len(period_data["rows"]) > 1:
+            charts.append({"id": "chart_line_period", "type": "line", "title": f"{value_col} over Time", "x": period_col, "y": value_col})
+        if primary_data:
+            pivots.append({"id": "pivot_primary", "title": f"{value_col} by {primary_col or 'Entity'}", "dataSource": "primaryTotals"})
+        if section_data and len(section_data["rows"]) > 1:
+            pivots.append({"id": "pivot_section", "title": f"{value_col} by Section", "dataSource": "sectionTotals"})
+        blueprint = {"profile": profile, "cards": cards, "charts": charts, "pivots": pivots,
+                     "tableFormat": "wide", "analytics": analytics, "aiGenerated": False}
+    else:
+        ai_result = generate_blueprint_with_ai(headers, data_objects, profile, table_format, analytics)
+        if ai_result:
+            blueprint = {"profile": profile, "cards": ai_result["cards"], "charts": ai_result["charts"],
+                         "pivots": ai_result["pivots"], "tableFormat": "long", "analytics": None,
+                         "aiGenerated": True, "datasetSummary": ai_result.get("datasetSummary", "")}
+        else:
+            fallback = generate_blueprint_fallback(profile, analytics, table_format)
+            blueprint = {"profile": profile, "cards": fallback["cards"], "charts": fallback["charts"],
+                         "pivots": fallback["pivots"], "tableFormat": "long", "analytics": None, "aiGenerated": False}
+
+    return {
+        "tableData": table_data,
+        "blueprint": blueprint,
+        "fileName": p.name,
+        "sheetName": sheet_name,
+        "allSheets": all_sheets,
+    }
