@@ -49,7 +49,12 @@ def detect_format_hint(col: str, values: list) -> str:
         except Exception:
             pass
     if nums and all(0 <= n <= 1 for n in nums):
-        return "percent_decimal"
+        # only treat as percent_decimal if values are genuinely fractional
+        # (not just integers that happen to be 0 or 1, like count columns)
+        has_fractions = any(n != int(n) for n in nums)
+        has_range = any(0 < n < 1 for n in nums)
+        if has_fractions or has_range:
+            return "percent_decimal"
     return "number"
 
 

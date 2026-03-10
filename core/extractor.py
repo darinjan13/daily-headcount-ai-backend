@@ -55,7 +55,6 @@ def is_total_row(row: pd.Series, primary_col: str) -> bool:
 
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply all standard cleaning steps to a raw DataFrame."""
     df = df.dropna(how="all")
 
     first_row = df.iloc[0]
@@ -85,12 +84,6 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_from_bytes(contents: bytes, sheet_name: str = None) -> dict:
-    """
-    Core extraction function.
-    Takes raw xlsx bytes + optional sheet name.
-    Returns full table payload ready for blueprint generation.
-    Also returns allSheets for sheet switching.
-    """
     excel = pd.ExcelFile(io.BytesIO(contents))
     all_sheets = excel.sheet_names
 
@@ -107,16 +100,19 @@ def extract_from_bytes(contents: bytes, sheet_name: str = None) -> dict:
     if wide_info["is_wide"]:
         df_wide, renamed_date_cols, core_cols, value_col_name, has_sections = build_wide_table(df, wide_info)
         analytics = build_analytics(df_wide, renamed_date_cols, core_cols, value_col_name, has_sections)
-        _wide_payload = df_to_payload(df_wide)
+
+        primary_col = analytics.get("primaryCol") if analytics else (core_cols[0] if core_cols else None)
+        section_col = "Section" if has_sections else None
+
         table_data = {
-            **_wide_payload,
-            "rowCount": len(_wide_payload["rows"]),
-            "columnCount": len(_wide_payload["headers"]),
-            "dateCols": renamed_date_cols,
+            **df_to_payload(df_wide),
             "tableFormat": "wide",
             "wasTransformed": True,
             "transformNote": f"Wide format detected: {len(renamed_date_cols)} date columns across {len(df_wide)} rows.",
             "analytics": analytics,
+            "dateCols": renamed_date_cols,
+            "primaryCol": primary_col,
+            "sectionCol": section_col,
         }
     else:
         records = df.to_dict(orient="records")
@@ -126,11 +122,13 @@ def extract_from_bytes(contents: bytes, sheet_name: str = None) -> dict:
             "rows": rows_out,
             "rowCount": len(rows_out),
             "columnCount": len(df.columns),
-            "dateCols": [],
             "tableFormat": "long",
             "wasTransformed": False,
             "transformNote": None,
             "analytics": None,
+            "dateCols": [],
+            "primaryCol": None,
+            "sectionCol": None,
         }
 
     return table_data, all_sheets, sheet_name
