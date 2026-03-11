@@ -12,6 +12,7 @@ def build_chat_response(
     headers: List[str],
     rows: List[list],
     dataset_summary: Optional[str] = None,
+    current_chart_state: Optional[dict] = None,
 ) -> dict:
     if not messages or not headers:
         return {"reply": "No data or messages provided.", "chartSpec": None, "filterSpec": None}
@@ -62,6 +63,23 @@ def build_chat_response(
                 f"[{samples}{'...' if len(unique) > 8 else ''}]"
             )
 
+    # Current chart context block
+    chart_context_block = ""
+    if current_chart_state:
+        chart_context_block = f"""
+CURRENT CHART STATE (the chart the user is most recently looking at):
+{json.dumps(current_chart_state, indent=2)}
+
+When the user sends a follow-up that MODIFIES this chart (e.g. "show top 10", "sort descending",
+"change to bar chart", "filter above 100", "limit to 5"), you MUST:
+1. Set "action": "modify" in CHART_SPEC
+2. Copy and update the current chart state fields accordingly
+3. Do NOT create a new chart
+
+When the user asks for a completely NEW analysis (different columns, different question), set "action": "new".
+If there is no current chart, always use "action": "new".
+"""
+
     system_context = f"""You are a data analyst assistant. The user has uploaded a spreadsheet.
 You have access to the FULL dataset below — use it to answer questions precisely.
 
@@ -72,7 +90,7 @@ DATASET OVERVIEW:
 
 COLUMN PROFILES (pre-computed aggregates):
 {chr(10).join(col_profiles)}
-
+{chart_context_block}
 FULL DATASET (CSV):
 {full_csv}
 
@@ -80,56 +98,29 @@ INSTRUCTIONS:
 - Use the full CSV data to answer questions exactly — count rows, group by columns, sum values, find top N, etc.
 - Format numbers with commas for readability
 - Keep answers concise unless the user asks for detail
-- NEVER output raw CSV, raw data rows, or data as plain text in your reply. Data is always shown via FILTER_SPEC or CHART_SPEC.
+- NEVER render markdown tables in your reply text. If the user asks to see/show/filter rows or columns, use FILTER_SPEC instead.
+- After answering, append specs on NEW LINES as described below when relevant.
 
----
+FILTER_SPEC — use when user wants to SEE rows or specific columns ("show me", "filter", "list", "give me rows where", etc.):
+FILTER_SPEC: {{"title": "...", "columns": ["EXACT col1", "EXACT col2"], "filters": [{{
+  "column": "EXACT column name", "operator": "eq|neq|contains|gt|gte|lt|lte", "value": "..."
+}}]}}
+- "columns" = which columns to display (empty array = show all)
+- "filters" = conditions to filter rows (empty array = no row filter, just column selection)
+- Use FILTER_SPEC whenever showing tabular data — never put tables in reply text
 
-CRITICAL RULE — FILTER_SPEC:
-When the user asks to show, list, display, filter, or see specific rows or columns
-(e.g. "show me section and name", "show me only sep 16-19", "list everyone from LG Homebased",
-"give me name and userid", "show columns X Y Z", "filter by section"),
-you MUST respond with a short one-sentence reply + a FILTER_SPEC on the next line.
-NEVER dump the data as CSV or plain text. ALWAYS use FILTER_SPEC instead.
-FILTER_SPEC results appear as an interactive table in the HOME TAB of the dashboard.
+CHART_SPEC — use when a chart would add genuine value (rankings, trends, breakdowns):
+CHART_SPEC: {{"action": "new"|"modify", "type": "bar|donut|line|pivot", "title": "...", "x": "EXACT column", "y": "EXACT column", "limit": <number or null>, "sort": "asc|desc|null", "filters": [{{"column": "...", "operator": "...", "value": "..."}}]}}
+For pivot: CHART_SPEC: {{"action": "new"|"modify", "type": "pivot", "title": "...", "rowDim": "EXACT column", "colDim": "EXACT column or null", "measure": "EXACT column", "aggregation": "sum|avg|count", "limit": <number or null>, "sort": "asc|desc|null"}}
 
-When the user specifies which columns to show (e.g. "show me name, userid, sep 16-19"),
-put exactly those columns in the "columns" array of the FILTER_SPEC.
-Use an empty "filters" array [] if there are no row conditions — this shows ALL rows with just those columns.
+CHART_SPEC fields:
+- "action": REQUIRED. "new" = create new chart, "modify" = update the existing current chart
+- "limit": top N rows to show (e.g. 10 for "top 10"). null = no limit
+- "sort": "desc" = highest first (default), "asc" = lowest first, null = natural order
+- "filters": row-level filters to apply before aggregation (same format as FILTER_SPEC filters)
 
-FILTER_SPEC format:
-FILTER_SPEC: {{"title": "...", "columns": ["col1", "col2", ...], "filters": [{{"column": "EXACT col", "operator": "eq|contains|gt|gte|lt|lte|neq", "value": "..."}}]}}
-
-Rules for FILTER_SPEC:
-- "title": short descriptive label shown above the table (e.g. "LG Homebased — Above 200,000")
-- "columns": list of column names to SHOW in the table — use exactly the columns the user asked for.
-  Column names MUST exactly match one of: {headers}
-- "filters": conditions to filter ROWS. Use [] if no row filter is needed (user only asked for columns).
-  - "column": MUST exactly match one of {headers}
-  - "operator": "eq" exact match, "contains" partial text, "gt"/"gte"/"lt"/"lte" numeric, "neq" not equal
-  - "value": always a string
-- Do NOT output FILTER_SPEC for aggregation questions (totals, averages, rankings) — use CHART_SPEC for those.
-
-Examples:
-User: "show me section, name, userid, sep 16-19"
-→ FILTER_SPEC: {{"title": "Section, Name, UserID — Sep 16 to 19", "columns": ["Section", "NAME", "UserID", "Sep 16", "Sep 17", "Sep 18", "Sep 19"], "filters": []}}
-
-User: "show employees from LG Homebased"
-→ FILTER_SPEC: {{"title": "LG Homebased Employees", "columns": ["Section", "NAME", "Total Production"], "filters": [{{"column": "Section", "operator": "eq", "value": "LG Homebased"}}]}}
-
-User: "list everyone above 200,000"
-→ FILTER_SPEC: {{"title": "High Performers — Above 200,000", "columns": ["Section", "NAME", "Total Production"], "filters": [{{"column": "Total Production", "operator": "gt", "value": "200000"}}]}}
-
----
-
-CHART_SPEC — use this for rankings, trends, and breakdowns (NOT for filter/show/list requests).
-CHART_SPEC results appear as a chart in the CHARTS TAB of the dashboard.
-CHART_SPEC: {{"type": "bar", "title": "...", "x": "EXACT column name", "y": "EXACT column name"}}
-CHART_SPEC: {{"type": "donut", "title": "...", "x": "EXACT column name", "y": "EXACT column name"}}
-CHART_SPEC: {{"type": "line", "title": "...", "x": "EXACT date column", "y": "EXACT numeric column"}}
-CHART_SPEC: {{"type": "pivot", "title": "...", "rowDim": "EXACT column", "colDim": "EXACT column or null", "measure": "EXACT column", "aggregation": "sum"}}
-
-Column names MUST exactly match one of: {headers}
-Only output one spec per response. FILTER_SPEC and CHART_SPEC cannot both appear in the same reply."""
+Column names in ALL specs MUST exactly match one of: {headers}
+Never output CHART_SPEC for simple factual questions. Never output both FILTER_SPEC and CHART_SPEC together."""
 
     history = "\n\n".join(
         f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
@@ -148,33 +139,38 @@ Only output one spec per response. FILTER_SPEC and CHART_SPEC cannot both appear
         filter_spec = None
         reply_text = raw
 
-        # ── Parse FILTER_SPEC ──────────────────────────────────────────────
-        if "FILTER_SPEC:" in raw:
-            parts = raw.split("FILTER_SPEC:", 1)
+        # Parse FILTER_SPEC first
+        if "FILTER_SPEC:" in reply_text:
+            parts = reply_text.split("FILTER_SPEC:", 1)
             reply_text = parts[0].strip()
             try:
                 spec_raw = parts[1].strip()
                 spec_raw = re.sub(r'^```(?:json)?\s*', '', spec_raw)
                 spec_raw = re.sub(r'\s*```$', '', spec_raw)
-                parsed = json.loads(spec_raw)
+                brace_count = 0
+                end_idx = 0
+                for i, ch in enumerate(spec_raw):
+                    if ch == '{': brace_count += 1
+                    elif ch == '}': brace_count -= 1
+                    if brace_count == 0 and i > 0:
+                        end_idx = i + 1
+                        break
+                filter_spec = json.loads(spec_raw[:end_idx])
                 valid = set(headers)
-                # validate all filter columns exist
-                bad = any(
-                    f.get("column") not in valid
-                    for f in parsed.get("filters", [])
-                )
-                # validate all display columns exist
-                bad = bad or any(c not in valid for c in parsed.get("columns", []))
-                if not bad:
-                    filter_spec = parsed
-                else:
-                    print(f"[Chat] FILTER_SPEC column validation failed: {parsed}")
+                filter_spec["columns"] = [c for c in filter_spec.get("columns", []) if c in valid]
+                filter_spec["filters"] = [
+                    f for f in filter_spec.get("filters", []) if f.get("column") in valid
+                ]
+                if not filter_spec.get("title"):
+                    filter_spec["title"] = "Filtered Data"
+                filter_spec["id"] = str(id(filter_spec))
             except Exception as parse_err:
                 print(f"[Chat] Filter spec parse error: {parse_err}")
+                filter_spec = None
 
-        # ── Parse CHART_SPEC ───────────────────────────────────────────────
-        elif "CHART_SPEC:" in raw:
-            parts = raw.split("CHART_SPEC:", 1)
+        # Parse CHART_SPEC
+        if "CHART_SPEC:" in reply_text:
+            parts = reply_text.split("CHART_SPEC:", 1)
             reply_text = parts[0].strip()
             try:
                 spec_raw = parts[1].strip()
@@ -182,12 +178,25 @@ Only output one spec per response. FILTER_SPEC and CHART_SPEC cannot both appear
                 spec_raw = re.sub(r'\s*```$', '', spec_raw)
                 chart_spec = json.loads(spec_raw)
                 valid = set(headers)
+
+                # Validate column refs
                 if chart_spec.get("x") and chart_spec["x"] not in valid:
                     chart_spec = None
                 if chart_spec and chart_spec.get("y") and chart_spec["y"] not in valid:
                     chart_spec = None
                 if chart_spec and chart_spec.get("rowDim") and chart_spec["rowDim"] not in valid:
                     chart_spec = None
+
+                # Default action to "new" if missing
+                if chart_spec and "action" not in chart_spec:
+                    chart_spec["action"] = "new"
+
+                # Validate filter columns in chart spec
+                if chart_spec and chart_spec.get("filters"):
+                    chart_spec["filters"] = [
+                        f for f in chart_spec["filters"] if f.get("column") in valid
+                    ]
+
             except Exception as parse_err:
                 print(f"[Chat] Chart spec parse error: {parse_err}")
                 chart_spec = None

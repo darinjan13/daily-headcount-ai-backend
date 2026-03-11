@@ -21,7 +21,6 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "https://headcount-ai.netlify.app",
-        "https://ui--headcount-ai.netlify.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -90,6 +89,7 @@ class ChatRequest(BaseModel):
     headers: List[str]
     rows: List[List]
     datasetSummary: Optional[str] = None
+    currentChartState: Optional[dict] = None
 
 @app.post("/chat")
 async def chat(payload: ChatRequest):
@@ -98,4 +98,5 @@ async def chat(payload: ChatRequest):
         headers=payload.headers,
         rows=payload.rows,
         dataset_summary=payload.datasetSummary,
+        current_chart_state=payload.currentChartState,
     )
