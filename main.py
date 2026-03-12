@@ -90,6 +90,8 @@ class ChatRequest(BaseModel):
     rows: List[List]
     datasetSummary: Optional[str] = None
     currentChartState: Optional[dict] = None
+    existingCharts: Optional[list] = None
+    existingTables: Optional[list] = None
 
 @app.post("/chat")
 async def chat(payload: ChatRequest):
@@ -99,4 +101,6 @@ async def chat(payload: ChatRequest):
         rows=payload.rows,
         dataset_summary=payload.datasetSummary,
         current_chart_state=payload.currentChartState,
+        existing_charts=payload.existingCharts,
+        existing_tables=payload.existingTables,
     )
