@@ -23,6 +23,7 @@ app.add_middleware(
         "https://headcount-ai.netlify.app",
         "https://wrexel-version--headcount-ai.netlify.app",
         "https://ui-headcount-ai.netlify.app",
+        "https://justine-ui--headcount-ai.netlify.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
