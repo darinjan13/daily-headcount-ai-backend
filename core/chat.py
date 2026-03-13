@@ -17,9 +17,8 @@ def build_chat_response(
     existing_tables: Optional[list] = None,
 ) -> dict:
     if not messages or not headers:
-        return {"reply": "No data or messages provided.", "chartSpec": None, "filterSpec": None}
+        return {"reply": "No data or messages provided.", "steps": []}
 
-    # Full dataset as CSV
     csv_header = ",".join(f'"{h}"' for h in headers)
     csv_rows = []
     for row in rows:
@@ -32,7 +31,6 @@ def build_chat_response(
         csv_rows.append(",".join(cells))
     full_csv = csv_header + "\n" + "\n".join(csv_rows)
 
-    # Column profiles
     col_profiles = []
     for col_idx, col in enumerate(headers):
         vals = [
@@ -42,7 +40,7 @@ def build_chat_response(
             and str(row[col_idx]).strip() != ""
         ]
         if not vals:
-            col_profiles.append(f"  • {col}: empty")
+            col_profiles.append(f"  * {col}: empty")
             continue
         num_vals = []
         for v in vals:
@@ -54,139 +52,138 @@ def build_chat_response(
             total = sum(num_vals)
             avg = total / len(num_vals)
             col_profiles.append(
-                f"  • {col}: numeric | sum={total:,.2f}, avg={avg:,.2f}, "
+                f"  * {col}: numeric | sum={total:,.2f}, avg={avg:,.2f}, "
                 f"min={min(num_vals):,.2f}, max={max(num_vals):,.2f}, count={len(num_vals)}"
             )
         else:
             unique = list({str(v).strip() for v in vals})
             samples = ", ".join(unique[:8])
             col_profiles.append(
-                f"  • {col}: category | {len(unique)} unique values: "
+                f"  * {col}: category | {len(unique)} unique values: "
                 f"[{samples}{'...' if len(unique) > 8 else ''}]"
             )
 
-    # Existing charts context
     charts_context_block = ""
     if existing_charts:
         chart_list = "\n".join(
             f"  - id:{c.get('id')} title:\"{c.get('title')}\" type:{c.get('type')} pinned:{c.get('pinned', False)}"
             for c in existing_charts
         )
-        charts_context_block = f"\nEXISTING CHARTS (currently in the dashboard):\n{chart_list}\n"
+        charts_context_block += f"\nEXISTING CHARTS (currently in the dashboard):\n{chart_list}\n"
 
+    existing_tables_block = "(none)"
     if existing_tables:
-        table_list = "\n".join(
-            f"  - id:{t.get('id')} title:\"{t.get('title')}\""
+        rows_list = "\n".join(
+            f"  - id:{t.get('id')} title:\"{t.get('title')}\" pinned:{t.get('pinned', False)} filters:{len(t.get('filters', []))} active"
             for t in existing_tables
         )
-        charts_context_block += f"\nEXISTING FILTER TABLES (currently in the dashboard):\n{table_list}\n"
+        existing_tables_block = rows_list
+        charts_context_block += f"\nEXISTING FILTER TABLES (currently on Home tab):\n{rows_list}\n"
 
-    # Existing tables context
-    existing_tables_block = "(none)" if not existing_tables else "\n".join(
-        f"  - id:{t.get('id')} title:\"{t.get('title')}\" pinned:{t.get('pinned', False)} filters:{len(t.get('filters', []))} active"
-        for t in existing_tables
-    )
-
-    # Current chart context block
     chart_context_block = ""
     if current_chart_state:
         chart_context_block = f"""
-CURRENT CHART STATE (the chart the user is currently editing):
+CURRENT CHART STATE (chart the user is editing):
 {json.dumps(current_chart_state, indent=2)}
 
 When the user modifies this chart (e.g. "show top 10", "sort descending", "change to bar", "filter above 100"):
 - Output a chart step with "action": "modify" and update the relevant fields
-
 When the user says "delete this" or "delete it":
-- Output a delete step: {{"type": "delete", "targetTitle": "{current_chart_state.get('title', '')}"}}
-
+- Output: {{"type": "delete", "targetTitle": "{current_chart_state.get('title', '')}"}}
 When the user asks for a completely NEW analysis, use "action": "new".
 """
 
-    system_context = f"""You are a data analyst assistant. The user has uploaded a spreadsheet.
-You have access to the FULL dataset below — use it to answer questions precisely.
+    system_context = f"""You are a powerful data analyst AI with full control over the dashboard.
+The user has uploaded a spreadsheet. You have access to the FULL dataset below.
 
 DATASET OVERVIEW:
 - Total rows: {len(rows):,}
 - Columns ({len(headers)}): {headers}
 - AI Summary: {dataset_summary or "N/A"}
 
-COLUMN PROFILES (pre-computed aggregates):
+COLUMN PROFILES:
 {chr(10).join(col_profiles)}
 {charts_context_block}{chart_context_block}
 FULL DATASET (CSV):
 {full_csv}
 
 INSTRUCTIONS:
-- Use the full CSV data to answer questions exactly — count rows, group by columns, sum values, find top N, etc.
-- Format numbers with commas for readability
-- Keep answers concise unless the user asks for detail
-- NEVER render markdown tables in your reply text.
-- After your reply, output a STEPS block if any actions are needed.
+- Use full CSV to answer questions precisely — count, sum, rank, group, compare
+- Format numbers with commas
+- NEVER render markdown tables in reply — use filter step instead
+- Output a STEPS block whenever any dashboard action is needed
 
-STEPS SYSTEM — for ANY action (charts, filters, deletes, pins), output a STEPS block:
+STEPS SYSTEM:
+Output after your reply:
 STEPS: [
   {{"type": "...", ...spec}},
-  {{"type": "...", ...spec}}
+  ...
 ]
+Steps execute IN ORDER. Combine any types in one block.
 
-Each step has a "type" field. Steps execute IN ORDER. You can combine multiple steps in one STEPS block.
+=== CHART STEPS (type: "chart") ===
+Bar/Hbar/Donut/Line:
+{{"type":"chart","action":"new","chartType":"bar|hbar|donut|line","title":"...","x":"EXACT col","y":"EXACT col","limit":<n|null>,"sort":"asc|desc|null","filters":[]}}
+Pivot:
+{{"type":"chart","action":"new","chartType":"pivot","title":"...","rowDim":"EXACT col","colDim":"EXACT col|null","measure":"EXACT col","aggregation":"sum|avg|count","limit":<n|null>}}
+Modify selected chart:
+{{"type":"chart","action":"modify","chartType":"...","title":"...","x":"...","y":"...","limit":<n>,"sort":"asc|desc"}}
 
-Step types:
+=== FILTER TABLE STEPS (type: "filter") ===
+Create a filtered data table on Home tab:
+{{"type":"filter","title":"...","columns":["EXACT col",...],"filters":[{{"column":"EXACT col","operator":"eq|neq|contains|gt|gte|lt|lte","value":"..."}}],"sort_col":"EXACT col|null","sort_dir":"asc|desc|null","limit":<n|null>}}
 
-1. Chart (type: "chart") — create or modify a chart:
-{{"type": "chart", "action": "new"|"modify", "chartType": "bar|hbar|donut|line|pivot", "title": "...", "x": "EXACT col", "y": "EXACT col", "limit": <n|null>, "sort": "asc|desc|null", "filters": []}}
-For pivot: {{"type": "chart", "action": "new"|"modify", "chartType": "pivot", "title": "...", "rowDim": "EXACT col", "colDim": "EXACT col|null", "measure": "EXACT col", "aggregation": "sum|avg|count", "limit": <n|null>}}
+=== DELETE CHART STEPS (type: "delete") ===
+{{"type":"delete","deleteAll":true}}
+{{"type":"delete","targetTitle":"<exact chart title>"}}
 
-2. Filter table (type: "filter") — show rows in a table:
-{{"type": "filter", "title": "...", "columns": ["EXACT col", ...], "filters": [{{"column": "EXACT col", "operator": "eq|neq|contains|gt|gte|lt|lte", "value": "..."}}]}}
+=== PIN CHART STEPS (type: "pin") ===
+{{"type":"pin","pinAll":true}}
+{{"type":"pin","unpinAll":true}}
+{{"type":"pin","targetTitle":"<exact chart title>","pinned":true|false}}
 
-3. Delete chart (type: "delete") — remove chart(s):
-{{"type": "delete", "deleteAll": true}} — removes ALL custom charts
-{{"type": "delete", "targetTitle": "<exact chart title>"}} — removes ONE specific chart
+=== RENAME CHART (type: "rename") ===
+{{"type":"rename","targetTitle":"<current title>","newTitle":"<new title>"}}
 
-4. Delete filter table (type: "delete_table") — remove filter table(s):
-{{"type": "delete_table", "deleteAll": true}} — removes ALL filter tables
-{{"type": "delete_table", "targetTitle": "<exact table title>"}} — removes ONE specific table
+=== MODIFY CHART DISPLAY (type: "modify_chart") ===
+Only changes limit/sort, no data refetch:
+{{"type":"modify_chart","targetTitle":"<exact title>","limit":<n|null>,"sort":"asc|desc|null"}}
 
-4. Pin/unpin chart (type: "pin") — pin or unpin chart(s):
-{{"type": "pin", "pinAll": true}} — pins ALL existing charts
-{{"type": "pin", "unpinAll": true}} — unpins ALL charts
-{{"type": "pin", "targetTitle": "<exact chart title>", "pinned": true|false}} — pin or unpin ONE chart by title
+=== NAVIGATE (type: "navigate") ===
+{{"type":"navigate","tab":"home|charts"}}
 
-5. Rename chart (type: "rename") — rename an existing chart:
-{{"type": "rename", "targetTitle": "<current title>", "newTitle": "<new title>"}}
+=== TABLE MANAGEMENT (type: "table_action") ===
+ALL filter table operations. Use ONLY table_action (never delete_table):
 
-6. Navigate (type: "navigate") — switch the active dashboard tab:
-{{"type": "navigate", "tab": "home"|"charts"}}
+Delete:       {{"type":"table_action","action":"delete","targetTitle":"<exact title>"}}
+Delete all:   {{"type":"table_action","action":"deleteAll"}}
+Pin:          {{"type":"table_action","action":"pin","targetTitle":"<exact title>"}}
+Pin all:      {{"type":"table_action","action":"pinAll"}}
+Unpin all:    {{"type":"table_action","action":"unpinAll"}}
+Rename:       {{"type":"table_action","action":"rename","targetTitle":"<current title>","newTitle":"<new title>"}}
+Sort:         {{"type":"table_action","action":"sort","targetTitle":"<exact title>","sort_col":"EXACT col","sort_dir":"asc|desc"}}
+Limit rows:   {{"type":"table_action","action":"limit","targetTitle":"<exact title>","limit":<n>}}
+Add filter:   {{"type":"table_action","action":"add_filter","targetTitle":"<exact title>","filter":{{"column":"EXACT col","operator":"eq|neq|contains|gt|gte|lt|lte","value":"..."}}}}
+Remove filter:{{"type":"table_action","action":"remove_filter","targetTitle":"<exact title>","filter_column":"EXACT col"}}
 
-7. Sort/limit existing chart (type: "modify_chart") — update display settings on an existing chart without regenerating:
-{{"type": "modify_chart", "targetTitle": "<exact title>", "limit": <n|null>, "sort": "asc|desc|null"}}
-
-8. Filter table control (type: "table_action") — manage existing filtered tables:
-{{"type": "table_action", "action": "delete", "targetTitle": "<exact title>"}} — delete a specific table
-{{"type": "table_action", "action": "deleteAll"}} — delete ALL filtered tables
-{{"type": "table_action", "action": "pin", "targetTitle": "<exact title>"}} — pin a table so it persists
-{{"type": "table_action", "action": "pinAll"}} — pin ALL filtered tables
-{{"type": "table_action", "action": "rename", "targetTitle": "<current title>", "newTitle": "<new title>"}} — rename a table
-
-EXISTING FILTERED TABLES (currently visible on Home tab):
+EXISTING FILTER TABLES:
 {existing_tables_block}
+
 RULES:
-- Output STEPS only when action is needed. For pure questions, no STEPS needed.
-- Steps run in the order listed — e.g. delete first, then create: [{{"type":"delete","deleteAll":true}}, {{"type":"chart",...}}]
-- When user says "pin all", "save all", "keep all" → use pin step with pinAll: true
-- When user says "pin X chart" → use pin step with targetTitle matching from EXISTING CHARTS
-- When creating charts and user also says "pin them" → add chart steps then a pin step with pinAll: true
-- When user says "rename X to Y" → use rename step
-- When user says "delete all tables", "clear tables", "remove filtered tables" → table_action deleteAll
-- When user says "pin the X table", "save X table" → table_action pin with targetTitle
-- When user says "pin all tables" → table_action pinAll
-- When user says "rename X table to Y" → table_action rename
-- Column names in ALL steps MUST exactly match one of: {headers}
-- Never put tabular data in reply text — always use a filter step instead
-- Use "chart" steps for rankings, trends, breakdowns; use "filter" steps for showing raw rows
-- For modify: only output a chart step with action "modify" when a chart is currently selected"""
+- Column names MUST exactly match one of: {headers}
+- NEVER use delete_table type — always use table_action
+- "delete [name] table" / "remove [name] table" → table_action delete
+- "delete all tables" / "clear all tables" → table_action deleteAll
+- "sort [table] by [col] ascending/descending" → table_action sort
+- "only show top N rows in [table]" → table_action limit
+- "filter [table] where X > Y" → table_action add_filter
+- "remove [col] filter from [table]" → table_action remove_filter
+- "pin [table]" → table_action pin
+- "pin all tables" → table_action pinAll
+- "rename [table] to X" → table_action rename
+- "pin chart X" → pin step with targetTitle from EXISTING CHARTS
+- "go to home/charts tab" → navigate step
+- Deletes before creates in multi-step sequences"""
 
     history = "\n\n".join(
         f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
@@ -200,11 +197,9 @@ RULES:
             contents=full_prompt,
         )
         raw = response.text.strip().removeprefix("Assistant:").strip()
-
         reply_text = raw
         steps = []
 
-        # Parse STEPS block
         if "STEPS:" in reply_text:
             parts = reply_text.split("STEPS:", 1)
             reply_text = parts[0].strip()
@@ -227,11 +222,10 @@ RULES:
                     stype = step.get("type")
 
                     if stype == "chart":
-                        chart_type = step.get("chartType", "bar")
-                        step["chartType"] = chart_type
                         if step.get("x") and step["x"] not in valid: continue
                         if step.get("y") and step["y"] not in valid: continue
                         if step.get("rowDim") and step["rowDim"] not in valid: continue
+                        if "chartType" not in step: step["chartType"] = "bar"
                         if "action" not in step: step["action"] = "new"
                         if step.get("filters"):
                             step["filters"] = [f for f in step["filters"] if f.get("column") in valid]
@@ -240,6 +234,8 @@ RULES:
                     elif stype == "filter":
                         step["columns"] = [c for c in step.get("columns", []) if c in valid]
                         step["filters"] = [f for f in step.get("filters", []) if f.get("column") in valid]
+                        if step.get("sort_col") and step["sort_col"] not in valid:
+                            step["sort_col"] = None
                         if not step.get("title"): step["title"] = "Filtered Data"
                         step["id"] = str(id(step))
                         steps.append(step)
@@ -247,8 +243,12 @@ RULES:
                     elif stype == "delete":
                         steps.append(step)
 
+                    # Auto-translate legacy delete_table to table_action
                     elif stype == "delete_table":
-                        steps.append(step)
+                        if step.get("deleteAll"):
+                            steps.append({"type": "table_action", "action": "deleteAll"})
+                        elif step.get("targetTitle"):
+                            steps.append({"type": "table_action", "action": "delete", "targetTitle": step["targetTitle"]})
 
                     elif stype == "pin":
                         steps.append(step)
@@ -266,21 +266,27 @@ RULES:
                             steps.append(step)
 
                     elif stype == "table_action":
-                        if step.get("action"):
-                            steps.append(step)
+                        act = step.get("action")
+                        if not act:
+                            continue
+                        if step.get("sort_col") and step["sort_col"] not in valid:
+                            step["sort_col"] = None
+                        if act == "add_filter":
+                            if not step.get("filter", {}).get("column") in valid:
+                                continue
+                        steps.append(step)
 
             except Exception as parse_err:
                 print(f"[Chat] Steps parse error: {parse_err}")
                 steps = []
 
-        # Legacy fallback for old spec formats
+        # Legacy fallback
         if not steps:
             if "DELETE_SPEC:" in reply_text:
                 parts = reply_text.split("DELETE_SPEC:", 1)
                 reply_text = parts[0].strip()
                 try:
-                    spec_raw = parts[1].strip()
-                    spec_raw = re.sub(r'^```(?:json)?\s*', '', spec_raw)
+                    spec_raw = re.sub(r'^```(?:json)?\s*', '', parts[1].strip())
                     brace_count = 0; end_idx = 0
                     for i, ch in enumerate(spec_raw):
                         if ch == '{': brace_count += 1
@@ -293,8 +299,7 @@ RULES:
                 parts = reply_text.split("FILTER_SPEC:", 1)
                 reply_text = parts[0].strip()
                 try:
-                    spec_raw = parts[1].strip()
-                    spec_raw = re.sub(r'^```(?:json)?\s*', '', spec_raw)
+                    spec_raw = re.sub(r'^```(?:json)?\s*', '', parts[1].strip())
                     brace_count = 0; end_idx = 0
                     for i, ch in enumerate(spec_raw):
                         if ch == '{': brace_count += 1
@@ -313,8 +318,7 @@ RULES:
                 parts = reply_text.split("CHART_SPEC:", 1)
                 reply_text = parts[0].strip()
                 try:
-                    spec_raw = parts[1].strip()
-                    spec_raw = re.sub(r'^```(?:json)?\s*', '', spec_raw)
+                    spec_raw = re.sub(r'^```(?:json)?\s*', '', parts[1].strip())
                     cs = json.loads(spec_raw)
                     valid = set(headers)
                     if cs.get("x") and cs["x"] not in valid: cs = None
